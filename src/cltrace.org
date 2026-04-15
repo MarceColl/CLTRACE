@@ -1,0 +1,62 @@
+#+title: CLTRACE
+
+
+* What we are building
+
+=CLTRACE= is a DTrace inspired observability framework for Common Lisp programs.
+The objective is to be able to remotely open a shell in production (using
+Slynk/Swank) and to be able to safely introspect and debug issues in production
+with as little performance impact as possible.
+
+In order to do this =CLTRACE= exposes a way to create small safe programs that
+hook into your live system. These programs can be installed or uninstalled on a
+live system.
+
+Here is what a program may look like
+
+#+begin_src common-lisp
+(cltrace:define-program some-name
+  ((:entry cltrace:some-fn
+    :when (= a 3)
+    (print b)))
+#+end_src
+
+This program creates a probe on function ~some-fn~, when installed everytime
+that ~some-fn~ is called with argument ~a~ with value 3 then ~(print b)~ will be
+called printing the value of argument ~b~.
+
+* How to introspect safely 
+
+DTrace created a custom language that had no control structures and very little
+in the way of normal programming constructs. This removed the ability for the
+user to fuck up in the worst moment (when debugging production). We will follow
+a similar philosophy where we create a small subset of Common Lisp that can run
+in the ~:when~ expressions and in the body of the probe.
+
+We name this language ~CLOSED~.
+
+Since we do not offer loops all =CLTRACE= probes are guaranteed to terminate and
+in most circumstances will be very fast.
+
+* Architecture
+
+There are three main areas in =CLTRACE=:
++ The program installation/reinstall/uninstall flow, how we modify functions at
+  runtime to provide probe access, etc.
++ The probe execution itself
++ The compilation of ~CLOSED~ to Common Lisp
+  
+* CLOSED
+
+** Language Goals
+
++ It should be a useful language to debug, but very limited in the damage it can
+  do.
++ We should have a way to access arguments of the function.
++ We should have a way to access the return value of the function.
++ We should have a way to print into some kind of searchable buffer.
++ We should have a way to get introspection into the context of a call (~stack~, etc)
++ No ifs, no loops.
++ We should have a way to save thread-local variables across probes.
+  
+  
