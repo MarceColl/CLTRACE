@@ -10,38 +10,52 @@
 (defparameter *cltrace-lock* (bt:make-lock))
 (defparameter *probe-registry* (make-hash-table :test #'equal))
 (defparameter *programs* (make-hash-table))
+(defparameter *installed-programs* ()
+  "Installed programs is a list of currently installed programs.")
 
 (defvar *args* nil "Special variable that holds the args when in a probe execution context")
 (defvar *result* nil "Special variable that holds the return value when in a probe execution context")
 
 (defclass probed-function (c2mop:funcallable-standard-object)
-  ((original :initarg :original :reader probed-function-original))
+  ((function-sym :initarg :function-sym :reader probed-function-sym)
+   (original :initarg :original :reader probed-function-original))
   (:metaclass c2mop:funcallable-standard-class))
 
-(defmethod initialize-instance :after ((pf probed-function))
-  (with-accessors ((original probed-function-original))
-      pf
-    (c2mop:set-funcallable-instance-function
-     pf
-     (lambda (&rest args)
-            (let ((*args* (loop for argname in argnames for argval in args collect (cons argname argval))))
-              (incf count-probes-run (run-probes :entry sym))
-              (let* ((result (apply original args))
-                     (*result* result))
-                (incf count-probes-run (run-probes :exit sym))
-                ;; We count then lock to reduce the amount of times we lock, we use
-                ;; the number of probes run as a heuristic
-                (when (= count-probes-run 0)
-                  ;; If no probes fired, lock the registry to make sure we don't uninstall
-                  ;; ourselves while another thread installs itself
-                  (bt:with-lock-held (*cltrace-lock*)
-                    (let ((all-probes (get-all-probes-for-fn sym)))
-                      (when (= (length all-probes) 0)
-                        (format t "Uninstalling from ~a~%" sym)
-                        ;; Restore original function
-                        (setf (symbol-function sym) original)))))
-                result))))))
-  
+(defmethod initialize-instance :after ((pf probed-function) &key &allow-other-key)
+  (with-accessors ((original probed-function-original)
+                   (sym probed-function-sym)) pf
+    (let* ((argnames (trivial-arguments:arglist original)))
+      (c2mop:set-funcallable-instance-function pf
+       (lambda (&rest args)
+         (let ((*args* (loop for argname in argnames for argval in args collect (cons argname argval)))
+               (count-probes-run 0))
+           ;; TODO(Marce): Handle errors around this
+           (incf count-probes-run (run-probes :entry sym))
+           (let* ((result (apply original args))
+                  (*result* result))
+             ;; TODO(Marce): Handle errors around this
+             (incf count-probes-run (run-probes :exit sym))
+             ;; We count then lock to reduce the amount of times we lock, we use
+             ;; the number of probes run as a heuristic
+             (when (= count-probes-run 0)
+               ;; If no probes fired, lock the registry to make sure we don't uninstall
+               ;; ourselves while another thread installs itself
+               (bt:with-lock-held (*cltrace-lock*)
+                 (let ((num-probes (get-count-of-probes-for-fn sym)))
+                   (when (= num-probes 0)
+                     (format t "Uninstalling from ~a~%" sym)
+                     ;; Restore original function
+                     (setf (symbol-function sym) original)))))
+             result)))))))
+
+(defun unwrap-probed-fn (fn-sym)
+  (let ((fn (symbol-function fn-sym)))
+    (when (probed-p fn)
+      (setf (symbol-function fn-sym)
+            (probed-function-original fn)))))
+
+(defun probed-p (fn)
+  (typep fn 'probed-function))
 
 (defun make-probe-key (where fn-sym)
   `(,where ,fn-sym))
@@ -49,24 +63,41 @@
 (defun run-probes (where fn-sym)
   "Run all registered probes for fn-sym at where. Returns the number of probes found."
   (format t "Function ~a called with ~a (returning ~a)~%" fn-sym *args* *result*)
-  (let* ((key (make-probe-key where fn-sym))
-         (probes (gethash key *probe-registry*)))
-    (dolist (probe probes)
-      (execute probe))
-    (length probes)))
+  (let ((key (make-probe-key where fn-sym))
+        (num-probes 0))
+    (dolist (p *installed-programs*)
+      (with-accessors ((probes program-probes))
+          p
+        (multiple-value-bind (probe present-p)
+            (gethash key probes)
+          (when present-p
+            (execute probe)
+            (incf num-probes)))))
+    num-probes))
 
-  ;; TODO
-(defun get-all-probes-for-fn (fn-sym))
+(defun get-count-of-probes-for-fn (fn-sym)
+  (let ((num-probes 0)
+        (entry-key (make-probe-key :entry fn-sym))
+        (exit-key (make-probe-key :exit fn-sym)))
+    (dolist (p *installed-programs*)
+      (with-accessors ((probes program-probes))
+          p
+        (multiple-value-bind (entry-probe entry-present-p)
+            (gethash entry-key probes)
+          (declare (ignore entry-probe))
+          (multiple-value-bind (exit-probe exit-present-p)
+              (gethash exit-key probes)
+            (declare (ignore exit-probe))
+            (when entry-present-p (incf num-probes))
+            (when exit-present-p (incf num-probes))))))
+    num-probes))
   
 (defun wrap-function-for-probing (sym)
   "Wraps a function for tracing purposes, if no probes run before or after we uninstall ourselves"
-  (let* ((original (symbol-function sym))
-         (argnames (trivial-arguments:arglist original))
-         (count-probes-run 0)
-         (wrapper (make-instance 'probed-function :original original)))
-    (setf (symbol-function sym) wrapper)))
-          
-
+  (let* ((original (symbol-function sym)))
+    (unless (probed-p original)
+      (let ((wrapper (make-instance 'probed-function :original original :function-sym sym)))
+        (setf (symbol-function sym) wrapper)))))
 
 (defclass probe ()
   ((fn-sym :initarg :fn-sym :accessor probe-fn-sym)
@@ -126,7 +157,7 @@ When expressions are limited in what they can do, any symbol is extracted from "
   (cond
     ((consp body-expr)
      (case (car body-expr)
-       ((print) `(format nil ,@(mapcar #'compile-body-expr (cdr body-expr))))
+       ((print) `(format t ,@(mapcar #'compile-body-expr (cdr body-expr))))
        (t (error "Unknown function in body expression"))))
     ((symbolp body-expr) `(get-arg ',body-expr))
     ;; Cannot be a symbol
@@ -154,20 +185,63 @@ When expressions are limited in what they can do, any symbol is extracted from "
                        :when when-lambda
                        :what body-lambda)))))
 
-(defmacro define-program (name &body body)
-  "Define a cltrace program"
+(defun %define-program (name body)
   (bt:with-lock-held (*cltrace-lock*)
-    (let ((program (get-or-create-program name))
-          (probes (mapcar #'parse-probe body)))
-      (install program probes))))
+    (let* ((program (get-or-create-program name))
+           (parsed-probes (mapcar #'parse-probe body))
+           (probes (alexandria:plist-hash-table
+                    (loop for p in parsed-probes
+                          nconc (list (make-probe-key
+                                       (probe-where p)
+                                       (probe-fn-sym p))
+                                      p))
+                    :test #'equal)))
+      (uninstall-program name)
+      (install program probes)
+      nil)))
+
+(defmacro define-program (name &body body)
+  "Define a cltrace program. This reinstalls the program with the new definition."
+  (%define-program name body))
+
+(defun hash-keys-difference (a b)
+  "Keys a - Keys b"
+  (let ((a-keys (alexandria:hash-table-keys a))
+        (b-keys (alexandria:hash-table-keys b))
+        (test-fn (hash-table-test b)))
+    (remove-if
+     (lambda (k)
+       (member k b-keys :test test-fn))
+     a-keys)))
 
 (defmethod install ((p program) probes)
-  "Installs all probes"
-  (format t "Installing ~a" p))
+  (with-accessors ((existing-probes program-probes))
+      p
+    (let* ((functions-keys (alexandria:hash-table-keys probes))
+           (function-syms (mapcar #'second functions-keys)))
+      ;; Setup functions for triggering probes
+      (dolist (f function-syms)
+        (wrap-function-for-probing f))
+      (setf (program-probes p) probes)
+      (push p *installed-programs*))))
+
+(defun installed-programs ()
+  "Returns list of installed programs in the image"
+  (mapcar #'name *installed-programs*))
+
+(defun uninstall-program (name)
+  "Uninstalls a program.
+
+Probes will no longer trigger probes from that program."
+  (setf *installed-programs*
+        (remove-if
+         (lambda (p)
+           (eq (name p) name))
+         *installed-programs*)))
 
 (define-program things
-  (((:entry some-test)
-    (print "~a" a))))
+  ((:entry some-test)
+   (print "~a" a)))
 
 (deftest when-expr
   (testing "compile-when-expr"
@@ -182,7 +256,7 @@ When expressions are limited in what they can do, any symbol is extracted from "
   (testing "print"
     (ok (equal
          (compile-body-expr '(print "~a" a))
-         '(format nil "~a" (get-arg 'a)))))
+         '(format t "~a" (get-arg 'a)))))
   (testing "compile to lambda"
     (let ((body-lambda (compile-body-into-lambda '((print "~a" a))))
           (*args* '((a . 2))))
